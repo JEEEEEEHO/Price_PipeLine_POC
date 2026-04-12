@@ -197,11 +197,98 @@ Kibana (Set별, Lane별 로그 대시보드)
 
 ---
 
-## Week 1: AWS 네트워킹 & 인프라 기초
+## Week 1: Linux/OS 기초 원리 + AWS 네트워킹 & 인프라
 
-**이 주차의 목표**: 이후 모든 실습의 기반이 되는 네트워크 구조를 손으로 직접 만들고 원리를 이해한다.
+**이 주차의 목표**: 인프라의 모든 배포 패턴은 OS 위에서 동작한다. "하나의 EC2에 여러 앱을 다른 포트로 띄우는 것이 어떻게 가능한가"처럼, AWS 서비스 이전에 Linux/OS 수준의 원리를 먼저 이해하고 네트워크 구조를 직접 만든다.
 
-### 핵심 개념
+### Part A: Linux / OS 기초 원리
+
+> **왜 여기서 배우는가**: AWS의 EC2, 컨테이너, 배포 스크립트는 모두 Linux 위에서 동작한다.
+> 포트 바인딩, 프로세스 격리, 서비스 관리 원리를 모르면 배포 구조가 왜 그렇게 설계됐는지 이해할 수 없다.
+
+**TCP 포트 바인딩 원리**
+
+```
+EC2 (Linux Kernel)
+│
+│  네트워크 패킷이 들어올 때 커널이 목적지 포트를 보고
+│  해당 포트를 바인딩한 프로세스의 소켓으로 전달
+│
+├── :8081  ──►  PID 1111 (App-1 JVM)   소켓 FD#7
+├── :8082  ──►  PID 2222 (App-2 JVM)   소켓 FD#7
+├── :8083  ──►  PID 3333 (App-3 JVM)   소켓 FD#7
+└── :8088  ──►  PID 4444 (Apache)      소켓 FD#5, FD#6
+    :8089  ──►  PID 4444 (Apache)      (같은 프로세스, 두 소켓)
+```
+
+- **소켓(Socket)**: 프로세스가 OS에 요청해서 얻는 네트워크 통신 창구. `IP:PORT` 조합으로 식별
+- **포트 바인딩**: `bind()` 시스템 콜 → 커널에 "이 포트는 내 프로세스가 받겠다" 등록
+- **포트 충돌**: 이미 바인딩된 포트에 다른 프로세스가 `bind()` 시도 → `Address already in use` 에러
+- **파일 디스크립터(FD)**: 소켓, 파일, 파이프 모두 FD로 관리. `ulimit -n`으로 최대 FD 수 제한
+- **LISTEN 상태 확인**: `ss -tlnp` 또는 `netstat -tlnp` 로 어떤 프로세스가 어떤 포트를 바인딩했는지 확인
+
+**프로세스 격리와 공유 자원**
+
+```
+EC2 물리 자원
+┌──────────────────────────────────────────────┐
+│  CPU: 4 core   RAM: 8GB   Disk I/O: 공유     │
+│                                              │
+│  ┌─────────────┐  ┌─────────────┐           │
+│  │ App-1 JVM   │  │ App-2 JVM   │           │
+│  │ PID 1111    │  │ PID 2222    │           │
+│  │ Heap: 2GB   │  │ Heap: 3GB   │           │
+│  │ Port: 8081  │  │ Port: 8082  │           │
+│  └─────────────┘  └─────────────┘           │
+│                                              │
+│  ⚠ Noisy Neighbor: App-2가 GC로 CPU 치솟으면  │
+│    App-1도 응답 지연 발생                     │
+└──────────────────────────────────────────────┘
+```
+
+- 프로세스는 독립된 메모리 공간(가상 주소 공간) → 서로 메모리 침범 불가
+- CPU, 네트워크 대역폭, Disk I/O는 **공유** → 한 앱의 폭주가 다른 앱에 영향 (Noisy Neighbor)
+- Docker 컨테이너: 동일한 커널 공유 + 네임스페이스(PID, NET, MNT)로 격리 → 같은 원리, 더 강한 격리
+
+**systemd 서비스 관리**
+
+```bash
+# /etc/systemd/system/app1.service
+[Unit]
+Description=Price App 1
+After=network.target
+
+[Service]
+User=app
+WorkingDirectory=/opt/apps/app1
+ExecStart=/usr/bin/java -jar app1.jar --server.port=8081
+Restart=on-failure        # 프로세스 죽으면 자동 재시작
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+```
+
+- `systemctl start/stop/restart app1`: 프로세스 시작/종료/재시작
+- `systemctl status app1`: 프로세스 상태, 최근 로그 확인
+- `journalctl -u app1 -f`: 실시간 로그 스트리밍
+- `Restart=on-failure`: EC2가 살아있어도 JVM이 죽으면 자동 재시작 → 단순한 고가용성 확보
+- **왜 중요한가**: 배포 스크립트에서 `systemctl restart app2`로 **특정 앱만** 재시작 → 나머지 앱 무중단
+
+**이 원리가 배포에 연결되는 지점**
+
+```
+zip 배포 패턴에서:
+  1. app2.zip → /opt/apps/app2/ 에 압축 해제 (파일 교체)
+  2. systemctl restart app2          (프로세스 재시작, :8082 재바인딩)
+  3. ALB TG-app2 Health Check 대기   (새 프로세스가 :8082 Listen 확인)
+  4. TG-app2 트래픽 전환              (ALB가 새 프로세스로 라우팅)
+
+  → app1(:8081), app3(:8083)은 전혀 영향받지 않음
+    Linux 포트 바인딩 독립성 덕분에 가능
+```
+
+### Part B: AWS 네트워킹 & 인프라
 
 - **VPC 내부 동작 원리**: CIDR 블록 설계, Subnet(Public/Private), Route Table, Internet Gateway, NAT Gateway
 - **Security Group vs NACL**: Stateful(SG) vs Stateless(NACL) 방화벽 차이 — 왜 두 개가 공존하는가
@@ -214,17 +301,21 @@ Kibana (Set별, Lane별 로그 대시보드)
 
 ### 핵심 질문 (주말까지 스스로 답할 수 있어야 함)
 
-1. Private Subnet의 EC2가 인터넷에 나가는 경로는? (NAT Gateway의 역할)
-2. Security Group은 왜 "Stateful"인가? (응답 트래픽에 별도 규칙이 없어도 되는 이유)
-3. IAM Role과 IAM User의 차이는? (EC2가 ECR에서 이미지를 pull할 때 Key를 파일로 저장하지 않아도 되는 이유)
-4. NLB가 8088/8089 두 포트를 동시에 Listener로 열 수 있는 원리는?
+1. 하나의 EC2에서 Apache가 8088과 8089를 동시에 Listen할 수 있는 OS 레벨 원리는?
+2. App-1(:8081)이 OOM으로 죽었을 때 App-2(:8082)는 왜 영향받지 않는가? 무엇이 영향받는가?
+3. `systemctl restart app2`로 배포할 때 app1 트래픽이 끊기지 않는 이유는?
+4. Private Subnet의 EC2가 ECR에서 이미지를 pull하는 경로는? (NAT Gateway vs VPC Endpoint)
+5. Security Group은 왜 "Stateful"인가? (응답 트래픽에 별도 규칙이 없어도 되는 이유)
 
 ### 실습
 
+- `ss -tlnp` 로 현재 EC2에서 바인딩된 포트 확인
+- 간단한 Python HTTP 서버를 두 포트로 띄우기: `python3 -m http.server 8081 &` + `8082 &`
+  → 두 프로세스가 독립적으로 응답하는 것 확인 → 하나 죽여도 나머지 살아있음 확인
+- systemd unit 파일 직접 작성 + `Restart=on-failure` 검증 (kill -9 후 자동 재시작 확인)
 - VPC 직접 설계: Public Subnet (NLB, Bastion), Private Subnet (Web, WAS, Redis, RDS)
 - EC2 Launch Template 생성 — tag 포함: `application=mo, lane=primary, stageNo=0, set=A, role=web`
 - ECR 리포지토리 생성 + IAM Role (EC2 → ECR pull 권한) 연결
-- Bastion Host → Private EC2 SSH 접속 (Jump Host 패턴)
 - Security Group 설계: NLB(8088/8089) → Web 허용, Web → ALB 허용, ALB → WAS(8080) 허용
 
 ---
@@ -417,17 +508,142 @@ aws elbv2 modify-listener \
   --default-actions Type=forward,TargetGroupArn=${NEW_TG_ARN}
 ```
 
+### 멀티앱 단일 EC2 패턴 (Zip 배포 방식)
+
+> **실무에서 자주 만나는 패턴**: 비용 절감을 위해 여러 앱을 하나의 EC2에 올리고,
+> 각각 다른 포트로 띄운 뒤 ALB에서 포트별 TG로 분리하는 구조.
+> Week 1에서 배운 Linux TCP 포트 바인딩 원리가 이 패턴의 기반.
+
+**[ 배포 파이프라인: S3 Zip 아티팩트 방식 ]**
+
+```
+소스 디렉토리 구조
+┌─────────────────────────┐
+│  /apps                  │
+│   ├── app1/             │
+│   ├── app2/             │
+│   └── app3/             │
+└────────────┬────────────┘
+             │ 빌드 (maven/gradle)
+             ▼
+┌─────────────────────────────────────────────────────┐
+│  GitHub Actions                                     │
+│                                                     │
+│  ├── app1/ → app1-{git-sha}.zip                    │
+│  ├── app2/ → app2-{git-sha}.zip                    │
+│  └── app3/ → app3-{git-sha}.zip                    │
+│              │                                      │
+│              ▼ S3 Upload                            │
+│  s3://bucket/{lane}/{stageNo}/{set}/                │
+│    ├── app1/{git-sha}/app1.zip                     │
+│    ├── app2/{git-sha}/app2.zip                     │
+│    └── app3/{git-sha}/app3.zip                     │
+└───────────────────────┬─────────────────────────────┘
+                        │ SSM Run Command
+                        │ (EC2 Tag로 대상 특정)
+                        ▼
+```
+
+**[ EC2 내부 구조: 멀티앱 + 포트 분리 ]**
+
+```
+┌──────────────────────────────────────────────────────────┐
+│  EC2  (tag: lane=primary, set=B, role=was)               │
+│                                                          │
+│  /opt/apps/                                              │
+│    ├── app1/  ←── app1.zip 압축해제                     │
+│    │     ├── app1.jar                                    │
+│    │     └── config/application.yml                      │
+│    │     [systemd: app1.service]                         │
+│    │      └── java -jar app1.jar --port=8081  ─► :8081  │
+│    │                                                      │
+│    ├── app2/  ←── app2.zip 압축해제                     │
+│    │     [systemd: app2.service]                         │
+│    │      └── java -jar app2.jar --port=8082  ─► :8082  │
+│    │                                                      │
+│    └── app3/  ←── app3.zip 압축해제                     │
+│          [systemd: app3.service]                         │
+│           └── java -jar app3.jar --port=8083  ─► :8083  │
+│                                                          │
+│  Linux Kernel TCP Stack                                  │
+│    inbound :8081 ──► app1 프로세스 소켓 (PID 1111)      │
+│    inbound :8082 ──► app2 프로세스 소켓 (PID 2222)      │
+│    inbound :8083 ──► app3 프로세스 소켓 (PID 3333)      │
+└──────────┬──────────────┬──────────────┬─────────────────┘
+           │ :8081         │ :8082         │ :8083
+           │               │               │
+```
+
+**[ ALB 라우팅 구조: TG 포트 오버라이드 ]**
+
+```
+           │ :8081         │ :8082         │ :8083
+           │               │               │
+┌──────────▼───────────────▼───────────────▼──────────────┐
+│  ALB (Internal)                                         │
+│                                                         │
+│  Listener :80                                           │
+│    ├── Rule: Path /app1/*  ──────────────► TG-app1     │
+│    ├── Rule: Path /app2/*  ──────────────► TG-app2     │
+│    └── Rule: Path /app3/*  ──────────────► TG-app3     │
+│                                                         │
+│  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐    │
+│  │  TG-app1    │  │  TG-app2    │  │  TG-app3    │    │
+│  │             │  │             │  │             │    │
+│  │  등록 대상: │  │  등록 대상: │  │  등록 대상: │    │
+│  │  EC2:8081   │  │  EC2:8082   │  │  EC2:8083   │    │
+│  │  ↑ 포트     │  │  ↑ 포트     │  │  ↑ 포트     │    │
+│  │  오버라이드 │  │  오버라이드 │  │  오버라이드 │    │
+│  │             │  │             │  │             │    │
+│  │ HealthCheck │  │ HealthCheck │  │ HealthCheck │    │
+│  │ GET :8081   │  │ GET :8082   │  │ GET :8083   │    │
+│  │ /health     │  │ /health     │  │ /health     │    │
+│  └─────────────┘  └─────────────┘  └─────────────┘    │
+└─────────────────────────────────────────────────────────┘
+
+  핵심: 같은 EC2 인스턴스가 3개 TG에 서로 다른 포트로 등록됨
+  → ALB Target Group은 인스턴스 등록 시 포트를 개별 지정 가능 (포트 오버라이드)
+```
+
+**app2만 배포할 때의 무중단 흐름**:
+```bash
+# 1. TG-app2에서 해당 EC2 Deregister (Draining 시작, app1/app3 영향 없음)
+aws elbv2 deregister-targets --target-group-arn {TG-app2} \
+  --targets Id={EC2-ID},Port=8082
+
+# 2. app2만 배포 (app1:8081, app3:8083은 운영 중)
+aws s3 cp s3://bucket/primary/0/B/app2/{git-sha}/app2.zip /opt/apps/app2/
+unzip -o app2.zip -d /opt/apps/app2/
+systemctl restart app2
+
+# 3. Health Check 후 TG-app2 다시 Register
+aws elbv2 register-targets --target-group-arn {TG-app2} \
+  --targets Id={EC2-ID},Port=8082
+```
+
+**이 패턴의 트레이드오프**:
+
+| 관점 | 멀티앱 단일 EC2 | 앱당 개별 EC2/컨테이너 |
+|------|-----------------|------------------------|
+| 비용 | 저렴 (EC2 1대) | 비쌈 |
+| 프로세스 격리 | 부분적 (JVM 분리, 커널·자원 공유) | 완전 격리 |
+| Noisy Neighbor | 발생 가능 (메모리/CPU 경합) | 없음 |
+| 배포 단위 | 앱별 zip 독립 배포 | 이미지 단위 |
+| OOM 장애 전파 | 전체 EC2 영향 가능 | 해당 컨테이너만 |
+
 ### 핵심 질문
 
 1. ASG Instance Refresh 중에 트래픽이 끊기지 않는 이유는? (Desired 수와 교체 비율의 관계)
 2. NLB Listener의 Target Group을 교체하면 기존 연결은 어떻게 되는가?
 3. User Data 스크립트가 실패하면 EC2는 어떤 상태가 되는가? (Health Check와의 관계)
 4. `docker stop` vs `docker kill` 차이는? 무중단 배포에서 어느 쪽을 써야 하는가?
+5. ALB Target Group에서 동일한 EC2를 8081/8082/8083으로 각각 다른 TG에 등록하는 방법은?
 
 ### 실습
 
 - NLB 8088/8089 듀얼 Listener 구성 → Apache EC2 연결
 - ALB Target Group SetA / SetB 생성 + Health Check 설정
+- **멀티앱 EC2 실습**: 하나의 EC2에 Spring Boot 앱 2개를 8081/8082 포트로 띄우고 ALB TG 2개에 포트 오버라이드 등록
 - ASG Launch Template에 User Data(ECR pull + docker run) 작성
 - deploy.sh 스크립트 작성 + 수동 실행으로 Set B 배포 → NLB 전환 → Set A 제거
 - Deregistration Delay를 30초로 줄이고 전환 중 요청 로그 관찰
@@ -771,7 +987,53 @@ main                  ← 최종 통합 결과물 (Week 7 완성본)
 | 원칙 | 내용 |
 |------|------|
 | **원리 우선** | 왜 이 기술이 존재하는가 → 어떻게 동작하는가 → 어떻게 쓰는가 순서로 접근 |
+| **다이어그램 우선** | 새로운 개념을 만나면 설명보다 그림을 먼저 요청/그리기. 아래 지침 참고 |
 | **로컬 우선** | Kafka, ELK, Docker Blue-Green은 로컬 Docker Compose로 먼저 → 원리 이해 후 AWS 이관 |
 | **직접 깨기** | 의도적으로 장애 상황(Consumer 죽이기, Health Check 실패, rotate 등)을 만들어 복구 흐름 관찰 |
 | **비용 주의** | 실습 후 리소스 즉시 삭제 (NAT Gateway, ALB, ElastiCache, DMS — Free Tier 미적용) |
 | **기록** | 주차별 "무엇을 몰랐고, 어떻게 이해했는가" 브랜치에 커밋 |
+
+---
+
+## 다이어그램 학습 지침
+
+> 텍스트 설명만으로 이해하기 어려운 인프라 개념은 **다이어그램을 먼저 그리고 나서** 설명을 붙이는 방식으로 접근한다.
+> "배포 파이프라인 → EC2 내부 구조 → ALB 라우팅" 같은 레이어 분리 다이어그램이 이해에 결정적으로 도움이 된다.
+
+### 다이어그램을 그려야 할 상황
+
+- **요청 흐름이 여러 컴포넌트를 거칠 때**: Client → 방화벽 → NLB → Apache → ALB → WAS
+- **하나의 컴포넌트 내부 구조가 궁금할 때**: EC2 안에서 포트/프로세스/파일이 어떻게 배치되는가
+- **데이터가 변환/이동하는 파이프라인**: RDS → DMS → Kafka → Consumer → Redis
+- **배포 전/후 상태 변화**: Blue(운영) → Green(배포) → 전환 → Blue 제거
+- **장애 시나리오**: Consumer 다운 시 메시지는 어디에 쌓이고, 재시작 후 어디서부터 읽는가
+
+### 다이어그램의 레이어 분리 원칙
+
+복잡한 구조는 하나의 큰 그림보다 **레이어별로 나누어** 그리는 것이 효과적:
+
+```
+레이어 1: 전체 흐름 (Big Picture)
+  → 어떤 컴포넌트들이 어떤 순서로 연결되는가
+
+레이어 2: 특정 컴포넌트 내부 (Zoom In)
+  → 그 컴포넌트 안에서 무슨 일이 일어나는가
+
+레이어 3: 데이터/상태 변화 (Before/After)
+  → 배포 전, 배포 중, 배포 후 상태가 어떻게 바뀌는가
+```
+
+예시: Week 3 멀티앱 EC2 패턴을 배울 때
+```
+레이어 1: [S3] → [SSM] → [EC2] → [ALB] → [Client]
+레이어 2: EC2 내부 = /opt/apps/app1(:8081) + app2(:8082) + app3(:8083)
+레이어 3: app2 배포 = TG Deregister → zip 교체 → restart → HealthCheck → Register
+```
+
+### Claude에게 다이어그램 요청하는 방법
+
+학습 중 개념이 잘 안 잡힐 때는 다음과 같이 요청:
+- `"이 구조를 레이어별 ASCII 다이어그램으로 그려줘"`
+- `"배포 전/후 상태를 Before/After 다이어그램으로 보여줘"`
+- `"EC2 내부에서 포트와 프로세스 관계를 그려줘"`
+- `"데이터가 흐르는 경로를 화살표로 표현해줘"`
