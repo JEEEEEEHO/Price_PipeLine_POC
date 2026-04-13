@@ -1,0 +1,36 @@
+# 파일 위치: /etc/systemd/system/was-mo.service
+#
+# was-pc.service와 비교 포인트:
+#   - ExecStart의 --server.port가 8083 (was-pc는 8082)
+#   - 두 unit 파일이 같은 EC2에 등록되어 독립적인 프로세스로 동작
+#
+# 재배포 시나리오 (was-mo만 재배포):
+#   sudo systemctl stop was-mo          ← was-pc는 8082로 계속 운영 중
+#   # 새 app-mo.jar 파일 교체
+#   sudo systemctl start was-mo         ← 새 프로세스 기동, 8083 재바인딩
+#   curl http://localhost:8083/health   ← Health Check
+#   # ALB Target Group 트래픽 전환
+
+[Unit]
+Description=Price WAS - Mobile
+After=network.target
+
+[Service]
+User=app
+WorkingDirectory=/opt/apps/was-mo
+
+ExecStart=/usr/bin/java \
+  -jar app-mo.jar \
+  --server.port=8083 \
+  --spring.profiles.active=primary
+
+Restart=on-failure
+RestartSec=5
+
+Environment="JAVA_OPTS=-Xms512m -Xmx1g -XX:+HeapDumpOnOutOfMemoryError -XX:HeapDumpPath=/var/log/was-mo/"
+
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

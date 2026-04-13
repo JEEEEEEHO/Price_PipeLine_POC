@@ -1,0 +1,88 @@
+{
+  "_comment": "EC2 Launch Template 설계 - WAS EC2 기준",
+  "_usage": "aws ec2 create-launch-template --cli-input-json file://launch-template.json",
+
+  "LaunchTemplateName": "price-was-template",
+  "VersionDescription": "v1 - WAS EC2 기본 템플릿",
+
+  "LaunchTemplateData": {
+    "_comment_ami": "Custom AMI: java17 + docker + awscli 미리 설치된 상태. 부팅 시간 단축.",
+    "ImageId": "ami-xxxxxxxxxxxxxxxxx",
+
+    "_comment_instance": "t3.medium: was-pc(1GB) + was-mo(1GB) 두 JVM을 하나의 EC2에서 운영",
+    "InstanceType": "t3.medium",
+
+    "KeyName": "price-keypair",
+
+    "IamInstanceProfile": {
+      "_comment": "EC2-WAS-Role 부여: S3, ECR, SSM, CloudWatch 접근 권한. 키 하드코딩 불필요.",
+      "Name": "price-was-instance-profile"
+    },
+
+    "NetworkInterfaces": [
+      {
+        "DeviceIndex": 0,
+        "SubnetId": "subnet-xxxxxxxxx",
+        "_comment_subnet": "Private Subnet - WAS (10.0.5.0/24, AZ-a)",
+        "Groups": ["sg-xxxxxxxxx"],
+        "_comment_sg": "sg-was: ALB에서 8082/8083 인바운드, Redis/RDS 아웃바운드 허용",
+        "AssociatePublicIpAddress": false
+      }
+    ],
+
+    "BlockDeviceMappings": [
+      {
+        "DeviceName": "/dev/xvda",
+        "Ebs": {
+          "VolumeSize": 30,
+          "VolumeType": "gp3",
+          "DeleteOnTermination": true,
+          "Encrypted": true
+        }
+      }
+    ],
+
+    "TagSpecifications": [
+      {
+        "ResourceType": "instance",
+        "Tags": [
+          {
+            "Key": "Name",
+            "Value": "price-primary-0-A-was",
+            "_comment": "price-{lane}-{stageNo}-{set}-{role} 패턴"
+          },
+          {
+            "Key": "application",
+            "Value": "mo",
+            "_comment": "mo | pc — 이 EC2가 담당하는 애플리케이션"
+          },
+          {
+            "Key": "lane",
+            "Value": "primary",
+            "_comment": "primary | stage | preview"
+          },
+          {
+            "Key": "stageNo",
+            "Value": "0",
+            "_comment": "stage lane에서만 1/2/3 사용. 나머지는 0"
+          },
+          {
+            "Key": "set",
+            "Value": "A",
+            "_comment": "A (Blue, 현재 운영) | B (Green, 신규 배포 대기)"
+          },
+          {
+            "Key": "role",
+            "Value": "was",
+            "_comment": "web | was"
+          }
+        ]
+      }
+    ],
+
+    "UserData": {
+      "_comment": "Base64 인코딩 필요. 아래는 디코딩된 스크립트 내용 (user-data.sh 파일 참고)",
+      "_script_path": "week1/practice/03-aws-infra/user-data.sh"
+    }
+  }
+}

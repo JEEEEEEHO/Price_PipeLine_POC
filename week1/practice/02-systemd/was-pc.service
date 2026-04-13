@@ -1,0 +1,43 @@
+# 파일 위치: /etc/systemd/system/was-pc.service
+#
+# 실습 방법:
+#   sudo cp was-pc.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl start was-pc
+#   sudo systemctl status was-pc
+#
+# Restart=on-failure 검증:
+#   sudo kill -9 $(pgrep -f "app-pc.jar")  ← JVM 강제 종료
+#   sudo systemctl status was-pc           ← 5초 후 자동 재시작 확인
+#   journalctl -u was-pc -f               ← 재시작 로그 실시간 확인
+
+[Unit]
+Description=Price WAS - PC
+# network.target 이후 시작: DB/Redis 접속이 필요하므로 네트워크 준비 후 기동
+After=network.target
+
+[Service]
+User=app
+WorkingDirectory=/opt/apps/was-pc
+
+# --server.port=8082 → 이 값이 커널에 bind()될 포트 번호
+# was-mo는 8083을 쓰므로 두 프로세스가 같은 EC2에서 독립적으로 동작 가능
+ExecStart=/usr/bin/java \
+  -jar app-pc.jar \
+  --server.port=8082 \
+  --spring.profiles.active=primary
+
+# on-failure: exit code 0 이외의 종료에만 재시작
+# (systemctl stop은 재시작하지 않음 → 배포 시 의도적 stop 가능)
+Restart=on-failure
+RestartSec=5
+
+# OOM 발생 시 힙 덤프 저장 경로
+Environment="JAVA_OPTS=-Xms512m -Xmx1g -XX:+HeapDumpOnOutOfMemoryError -XX:HeapDumpPath=/var/log/was-pc/"
+
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+# multi-user.target: systemctl enable 시 부팅 때 자동 시작
+WantedBy=multi-user.target

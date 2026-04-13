@@ -1,0 +1,79 @@
+{
+  "_comment": "EC2-WAS-Role에 붙는 IAM Policy. 최소 권한 원칙 적용.",
+  "_usage": "aws iam create-policy --policy-name PriceWasPolicy --policy-document file://iam-policy.json",
+
+  "Version": "2012-10-17",
+  "Statement": [
+
+    {
+      "Sid": "S3DeployBucketRead",
+      "_comment": "User Data 스크립트에서 zip 파일 다운로드 용도",
+      "Effect": "Allow",
+      "Action": [
+        "s3:GetObject",
+        "s3:ListBucket"
+      ],
+      "Resource": [
+        "arn:aws:s3:::price-deploy-bucket",
+        "arn:aws:s3:::price-deploy-bucket/*"
+      ]
+    },
+
+    {
+      "Sid": "ECRPull",
+      "_comment": "Docker 방식 배포 시 ECR에서 이미지 pull. IAM Role 덕분에 키 불필요.",
+      "Effect": "Allow",
+      "Action": [
+        "ecr:GetAuthorizationToken",
+        "ecr:BatchCheckLayerAvailability",
+        "ecr:GetDownloadUrlForLayer",
+        "ecr:BatchGetImage"
+      ],
+      "Resource": "*"
+    },
+
+    {
+      "Sid": "SSMParameterRead",
+      "_comment": "DB 비밀번호, Redis 주소 등 민감 정보를 코드에 하드코딩하지 않기 위함",
+      "Effect": "Allow",
+      "Action": [
+        "ssm:GetParameter",
+        "ssm:GetParameters",
+        "ssm:GetParametersByPath"
+      ],
+      "Resource": [
+        "arn:aws:ssm:ap-northeast-2:*:parameter/price/*"
+      ]
+    },
+
+    {
+      "Sid": "SSMSessionManager",
+      "_comment": "Bastion Host 없이 AWS 콘솔/CLI로 EC2에 접속 (SSH 키 불필요, 보안 강화)",
+      "Effect": "Allow",
+      "Action": [
+        "ssm:UpdateInstanceInformation",
+        "ssmmessages:CreateControlChannel",
+        "ssmmessages:CreateDataChannel",
+        "ssmmessages:OpenControlChannel",
+        "ssmmessages:OpenDataChannel"
+      ],
+      "Resource": "*"
+    },
+
+    {
+      "Sid": "CloudWatchLogs",
+      "_comment": "애플리케이션 로그를 CloudWatch Logs로 전송. ELK 연동 전 기본 로그 수집.",
+      "Effect": "Allow",
+      "Action": [
+        "logs:CreateLogGroup",
+        "logs:CreateLogStream",
+        "logs:PutLogEvents",
+        "logs:DescribeLogStreams"
+      ],
+      "Resource": [
+        "arn:aws:logs:ap-northeast-2:*:log-group:/price/*"
+      ]
+    }
+
+  ]
+}
